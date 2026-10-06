@@ -12,6 +12,23 @@ from app.exceptions import OperationError, ValidationError
 from app.history import LoggingObserver, AutoSaveObserver
 from app.operations import OperationFactory
 
+
+def run_mocked_repl(inputs, **method_results):
+    """Run the REPL with an isolated calculator and return its observable calls."""
+    with patch('app.calculator_repl.Calculator', autospec=True) as calculator_class, \
+         patch('builtins.input', side_effect=inputs), \
+         patch('builtins.print') as print_mock:
+        calculator = calculator_class.return_value
+        calculator.config = Mock()
+
+        for method_name, result in method_results.items():
+            getattr(calculator, method_name).return_value = result
+
+        calculator_repl()
+
+    return calculator, print_mock
+
+
 # Fixture to initialize Calculator with a temporary directory for file paths
 @pytest.fixture
 def calculator():
@@ -109,6 +126,12 @@ def test_redo(calculator):
     calculator.redo()
     assert len(calculator.history) == 1
 
+
+@pytest.mark.parametrize('method_name', ['undo', 'redo'])
+def test_undo_and_redo_return_false_when_stacks_are_empty(calculator, method_name):
+    assert getattr(calculator, method_name)() is False
+    assert calculator.history == []
+
 # Test History Management
 
 @patch('app.calculator.pd.DataFrame.to_csv')
@@ -118,6 +141,18 @@ def test_save_history(mock_to_csv, calculator):
     calculator.perform_operation(2, 3)
     calculator.save_history()
     mock_to_csv.assert_called_once()
+
+
+def test_save_empty_history(calculator):
+    calculator.save_history()
+
+    saved_history = pd.read_csv(calculator.config.history_file)
+
+    assert saved_history.empty
+    assert list(saved_history.columns) == [
+        'operation', 'operand1', 'operand2', 'result', 'timestamp'
+    ]
+
 
 @patch('app.calculator.pd.read_csv')
 @patch('app.calculator.Path.exists', return_value=True)
@@ -143,6 +178,49 @@ def test_load_history(mock_exists, mock_read_csv, calculator):
         assert calculator.history[0].result == Decimal("5")
     except OperationError:
         pytest.fail("Loading history failed due to OperationError")
+
+
+@patch('app.calculator.logging.info')
+def test_load_empty_history_file(logging_info_mock, calculator):
+    pd.DataFrame(
+        columns=['operation', 'operand1', 'operand2', 'result', 'timestamp']
+    ).to_csv(calculator.config.history_file, index=False)
+
+    calculator.load_history()
+
+    assert calculator.history == []
+    logging_info_mock.assert_called_once_with("Loaded empty history file")
+
+
+def test_history_views(calculator):
+    calculator.set_operation(OperationFactory.create_operation('add'))
+    calculator.perform_operation(2, 3)
+
+    history_frame = calculator.get_history_dataframe()
+    calculation = calculator.history[0]
+
+    assert list(history_frame.columns) == [
+        'operation', 'operand1', 'operand2', 'result', 'timestamp'
+    ]
+    assert history_frame.loc[0, 'operation'] == 'Addition'
+    assert history_frame.loc[0, 'operand1'] == '2'
+    assert history_frame.loc[0, 'operand2'] == '3'
+    assert history_frame.loc[0, 'result'] == '5'
+    assert history_frame.loc[0, 'timestamp'] == calculation.timestamp
+    assert calculator.show_history() == ['Addition(2, 3) = 5']
+
+
+def test_perform_operation_respects_maximum_history_size(calculator):
+    calculator.config.max_history_size = 1
+    calculator.set_operation(OperationFactory.create_operation('add'))
+
+    calculator.perform_operation(1, 2)
+    calculator.perform_operation(3, 4)
+
+    assert len(calculator.history) == 1
+    assert calculator.history[0].operand1 == Decimal('3')
+    assert calculator.history[0].operand2 == Decimal('4')
+    assert calculator.history[0].result == Decimal('7')
         
             
 # Test Clearing History
@@ -178,3 +256,89 @@ def test_calculator_repl_help(mock_print, mock_input):
 def test_calculator_repl_addition(mock_print, mock_input):
     calculator_repl()
     mock_print.assert_any_call("\nResult: 5")
+
+
+def test_calculator_repl_empty_history():
+    calculator, print_mock = run_mocked_repl(
+        ['history', 'exit'],
+        show_history=[],
+    )
+
+    calculator.show_history.assert_called_once_with()
+    print_mock.assert_any_call("No calculations in history")
+
+
+def test_calculator_repl_populated_history():
+    history_entry = "Addition(2, 3) = 5"
+    calculator, print_mock = run_mocked_repl(
+        ['history', 'exit'],
+        show_history=[history_entry],
+    )
+
+    calculator.show_history.assert_called_once_with()
+    print_mock.assert_any_call("\nCalculation History:")
+    print_mock.assert_any_call(f"1. {history_entry}")
+
+
+def test_calculator_repl_clear_history():
+    calculator, print_mock = run_mocked_repl(['clear', 'exit'])
+
+    calculator.clear_history.assert_called_once_with()
+    print_mock.assert_any_call("History cleared")
+
+
+def test_calculator_repl_save_history():
+    calculator, print_mock = run_mocked_repl(['save', 'exit'])
+
+    assert calculator.save_history.call_count == 2
+    print_mock.assert_any_call("History saved successfully")
+
+
+def test_calculator_repl_load_history():
+    calculator, print_mock = run_mocked_repl(['load', 'exit'])
+
+    calculator.load_history.assert_called_once_with()
+    print_mock.assert_any_call("History loaded successfully")
+
+
+@pytest.mark.parametrize(
+    ('command', 'method_name', 'result', 'message'),
+    [
+        ('undo', 'undo', True, 'Operation undone'),
+        ('undo', 'undo', False, 'Nothing to undo'),
+        ('redo', 'redo', True, 'Operation redone'),
+        ('redo', 'redo', False, 'Nothing to redo'),
+    ],
+)
+def test_calculator_repl_undo_and_redo(command, method_name, result, message):
+    calculator, print_mock = run_mocked_repl(
+        [command, 'exit'],
+        **{method_name: result},
+    )
+
+    getattr(calculator, method_name).assert_called_once_with()
+    print_mock.assert_any_call(message)
+
+
+def test_calculator_repl_unknown_command():
+    _, print_mock = run_mocked_repl(['unknown', 'exit'])
+
+    print_mock.assert_any_call(
+        "Unknown command: 'unknown'. Type 'help' for available commands."
+    )
+
+
+@pytest.mark.parametrize(
+    'inputs',
+    [
+        ['add', 'cancel', 'exit'],
+        ['add', '2', 'cancel', 'exit'],
+    ],
+    ids=['first-operand', 'second-operand'],
+)
+def test_calculator_repl_cancels_operation(inputs):
+    calculator, print_mock = run_mocked_repl(inputs)
+
+    calculator.set_operation.assert_not_called()
+    calculator.perform_operation.assert_not_called()
+    print_mock.assert_any_call("Operation cancelled")

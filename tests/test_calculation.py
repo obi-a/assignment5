@@ -109,6 +109,28 @@ def test_equality():
     assert calc1 != calc3
 
 
+def test_string_representations():
+    timestamp = datetime(2025, 1, 2, 3, 4, 5)
+    calc = Calculation(
+        operation="Addition",
+        operand1=Decimal("2"),
+        operand2=Decimal("3"),
+        timestamp=timestamp,
+    )
+
+    assert str(calc) == "Addition(2, 3) = 5"
+    assert repr(calc) == (
+        "Calculation(operation='Addition', operand1=2, operand2=3, "
+        "result=5, timestamp='2025-01-02T03:04:05')"
+    )
+
+
+def test_equality_with_unrelated_type():
+    calc = Calculation(operation="Addition", operand1=Decimal("2"), operand2=Decimal("3"))
+
+    assert calc != object()
+
+
 # New Test to Cover Logging Warning
 def test_from_dict_result_mismatch(caplog):
     """
